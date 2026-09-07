@@ -15,7 +15,7 @@ desc: |
   内存缓存结果，收到查询优先读缓存，回复速度快。支持群聊/私聊独立开关与群号/
   用户白名单配置，未开启或不匹配时静默忽略（指令路径会给出提示）。
 author: Echo
-version: 1.0.0
+version: 1.0.1
 repo: https://github.com/fanqiecd/astrbot_plugin_warband_status
 astrbot_version: ">=4.17.0,<5"
 support_platforms:

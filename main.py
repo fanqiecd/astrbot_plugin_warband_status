@@ -35,6 +35,7 @@ DEFAULT_MASTER_URL = "https://warbandmain.taleworlds.com/handlerservers.ashx?typ
 DEFAULT_SERVERS = ["CN_X1", "CN_X3_GK", "CN_X4"]
 DEFAULT_SEED_HOSTS = ["116.62.36.206"]
 DEFAULT_EXTRA_ENDPOINTS = ["106.54.62.240:7240", "106.54.62.240:7242"]
+DEFAULT_EXCLUDE_SERVERS = ["CN_X4_zuikuai"]
 
 NAME_RE = re.compile(r"^CN_X", re.IGNORECASE)
 # 关键字触发：关键词后可跟目标（可无空格），如「查服X1」「查询服务器 CN_X4」
@@ -78,6 +79,11 @@ class WarbandServerStatusPlugin(Star):
         raw = self._cfg(key, [])
         return {str(item).strip() for item in raw or [] if str(item).strip()}
 
+    def _excluded(self) -> set[str]:
+        """需要隐藏、不参与查询展示的服务器名（默认排除 CN_X4_zuikuai）。"""
+        raw = self._cfg("exclude_servers", DEFAULT_EXCLUDE_SERVERS)
+        return {str(item).strip() for item in raw or [] if str(item).strip()}
+
     def _servers(self) -> list[str]:
         raw = self._cfg("servers", DEFAULT_SERVERS)
         names: list[str] = []
@@ -117,8 +123,10 @@ class WarbandServerStatusPlugin(Star):
         二者都可用作查询目标。
         """
 
+        excluded = self._excluded()
+
         def _add(key: str) -> None:
-            if key and key not in keys:
+            if key and key not in keys and key not in excluded:
                 keys.append(key)
 
         keys: list[str] = []
@@ -286,6 +294,8 @@ class WarbandServerStatusPlugin(Star):
         name = (stats.get("name") or "").strip()
         if not name:
             return
+        if name in self._excluded():
+            return  # 配置排除的服务器不缓存、不展示
         if not explicit and name not in self._servers() and not NAME_RE.match(name):
             return
         self._known_hosts.add(ip)

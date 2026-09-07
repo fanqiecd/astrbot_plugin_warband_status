@@ -32,9 +32,16 @@
   "servers": {
     "type": "list",
     "description": "默认查询并展示的服务器名称及顺序（全量查询时按此顺序输出）。",
-    "hint": "中文站 X 系列如 CN_X1 / CN_X3_GK / CN_X4。未在列表中的 CN_X 前缀服务器在线时也会被自动发现并展示。",
+    "hint": "中文站 X 系列如 CN_X1 / CN_X3_GK / CN_X4。未在列表中的 CN_X 前缀服务器在线时也会被自动发现并展示，不需要的可用 exclude_servers 排除。",
     "items": { "type": "string" },
     "default": ["CN_X1", "CN_X3_GK", "CN_X4"]
+  },
+  "exclude_servers": {
+    "type": "list",
+    "description": "需要隐藏、不参与查询展示的服务器名（匹配的服务器不会被缓存或返回）。",
+    "hint": "默认排除 CN_X4_zuikuai；如需显示可把该项从列表移除。",
+    "items": { "type": "string" },
+    "default": ["CN_X4_zuikuai"]
   },
   "extra_endpoints": {
     "type": "list",
