@@ -42,7 +42,7 @@ NAME_RE = re.compile(r"^CN_X", re.IGNORECASE)
 KEYWORD_RE = re.compile(
     r"^\s*(?:查服|查询服务器|服务器状态|骑砍服务器|骑砍状态|查骑砍)\s*(\S.*?)?\s*$"
 )
-BLOCK_SEP = "-----------------------------------"
+BLOCK_SEP = "---------------------------------"
 
 
 def endpoint_label(pair: tuple[str, int]) -> str:
