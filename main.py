@@ -64,6 +64,8 @@ class WarbandServerStatusPlugin(Star):
         self._sweep_offset = 0
         self._refresh_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
+        self._discover_lock = asyncio.Lock()
+        self._last_probe_all: dict[tuple[str, int], float] = {}
         self._bg_task: asyncio.Task | None = None
 
     # ---------- 配置 ----------
@@ -224,16 +226,16 @@ class WarbandServerStatusPlugin(Star):
             quick = [(ip, port) for ip, port in addrs if ip in hosts]
             if quick:
                 for ip, port, stats in await wnet.probe_many(quick, timeout):
-                    self._apply_result(ip, port, stats)
+                    self._record_probe(ip, port, stats)
 
             # 固定端点：每轮直接探测（不依赖主服务器列表），无论名称是否 CN_X 都收录
             extra = self._extra_endpoints()
             if extra:
                 for ip, port, stats in await wnet.probe_many(extra, timeout):
                     label = endpoint_label((ip, port))
+                    self._record_probe(ip, port, stats)
                     name = (stats.get("name") or "").strip() if stats else ""
                     if name:
-                        self._apply_result(ip, port, stats, explicit=True)
                         self._endpoint_last[label] = name
                     else:
                         # 无响应：移除该端点对应的缓存记录，保留最后已知名供离线展示
@@ -253,7 +255,7 @@ class WarbandServerStatusPlugin(Star):
                     chosen = [others[(offset + i) % len(others)] for i in range(limit)]
                     self._sweep_offset = (offset + limit) % len(others)
                     for ip, port, stats in await wnet.probe_many(chosen, timeout):
-                        self._apply_result(ip, port, stats)
+                        self._record_probe(ip, port, stats)
 
             # 下线复核：缓存中但已不在主列表的地址直接复查一次
             for name, rec in list(self._cache.items()):
@@ -266,6 +268,7 @@ class WarbandServerStatusPlugin(Star):
                 except ValueError:
                     continue
                 stats = await wnet.fetch_server_stats(ip_s, port_i, timeout)
+                self._last_probe_all[(ip_s, port_i)] = time.time()
                 if stats is None or (stats.get("name") or "") != name:
                     self._cache.pop(name, None)
                     self._offline_since[name] = time.time()
@@ -273,21 +276,20 @@ class WarbandServerStatusPlugin(Star):
             self._last_refresh = time.time()
             return True
 
-    def _apply_result(
-        self,
-        ip: str,
-        port: int,
-        stats: dict[str, Any] | None,
-        *,
-        explicit: bool = False,
-    ) -> None:
+    def _record_probe(self, ip: str, port: int, stats: dict[str, Any] | None) -> None:
+        """记录一次探测（供按需发现去重），并写入缓存。"""
+        self._last_probe_all[(ip, port)] = time.time()
+        self._apply_result(ip, port, stats)
+
+    def _apply_result(self, ip: str, port: int, stats: dict[str, Any] | None) -> None:
         """写入一次探测结果。
+
+        只要服务器返回了名称就收录（供按名称查询），但受 exclude_servers 排除。
 
         Args:
             ip: 服务器 IP。
             port: 服务器端口。
             stats: 解析出的服务器信息。
-            explicit: 是否为固定端点探测结果（不受 CN_X 命名过滤限制）。
         """
         if not stats:
             return
@@ -296,8 +298,6 @@ class WarbandServerStatusPlugin(Star):
             return
         if name in self._excluded():
             return  # 配置排除的服务器不缓存、不展示
-        if not explicit and name not in self._servers() and not NAME_RE.match(name):
-            return
         self._known_hosts.add(ip)
         self._cache[name] = {
             "name": name,
@@ -307,12 +307,47 @@ class WarbandServerStatusPlugin(Star):
         }
         self._offline_since.pop(name, None)
 
+    @staticmethod
+    def _is_cn_like_name(raw: str) -> bool:
+        """判断目标是否可能是 CN_ 前缀的服务器名（用于触发按需发现）。"""
+        key = re.sub(r"[\s_\-]", "", raw).strip().lower().removeprefix("cn")
+        return bool(re.fullmatch(r"[a-z0-9]{2,30}", key))
+
+    async def _discover_names(self) -> None:
+        """按需全量探测：用于查询尚未被收录的服务器名（如 CN_Swiss_02）。
+
+        只探测近期未探过的地址，探测结果进入缓存后即可按名称查询。
+        """
+        if not bool(self._cfg("discovery_enabled", True)):
+            return
+        if self._refresh_lock.locked() or self._discover_lock.locked():
+            return  # 已有刷新/发现在进行，稍后即可命中缓存
+        async with self._discover_lock:
+            url = str(self._cfg("master_url", DEFAULT_MASTER_URL))
+            try:
+                addrs = await wnet.fetch_master_server_list(url, timeout=12.0)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("按需发现失败（主服务器列表不可达）: %s", exc)
+                return
+            if not addrs:
+                return
+            now = time.time()
+            todo = [a for a in addrs if now - self._last_probe_all.get(a, 0.0) > 90.0]
+            if not todo:
+                return
+            timeout = float(self._cfg("probe_timeout", 4))
+            self.logger.info("按名称查询触发在线发现，探测 %d 台服务器 ...", len(todo))
+            for ip, port, stats in await wnet.probe_many(todo, timeout, concurrency=64):
+                self._record_probe(ip, port, stats)
+
     # ---------- 目标解析与格式化 ----------
 
     def _resolve_target(self, raw: str, names: list[str]) -> str | None:
         """把用户输入解析成服务器名。
 
-        支持：全名（CN_X3_GK）、简称（X3 / GK / 3）、别名（全部 / all）等。
+        支持：全名（CN_X3_GK / CN_Swiss_02）、简称（X3 / GK / swiss02）、
+        别名（全部 / all）、端点端口号（7240）等；除传入的有序名单外，
+        也会匹配缓存中已收录的任何服务器名。
 
         Args:
             raw: 用户输入。
@@ -335,7 +370,11 @@ class WarbandServerStatusPlugin(Star):
                 return label
         if key.isdigit() and len(key) <= 2:
             key = f"x{key}"
-        for name in names:
+        search = list(names)
+        for cached in sorted(self._cache):
+            if cached not in search:
+                search.append(cached)
+        for name in search:
             nk = re.sub(r"[\s_\-]", "", name).lower().removeprefix("cn")
             if key == nk:
                 return name
@@ -399,14 +438,20 @@ class WarbandServerStatusPlugin(Star):
             resolved = self._resolve_target(target, keys)
             if resolved == "all":
                 target = ""
+            elif resolved is None and self._is_cn_like_name(target):
+                # 可能是尚未收录的 CN_ 系列服务器：先在线全量发现一次再解析
+                await self._discover_names()
+                resolved = self._resolve_target(target, self._ordered_keys())
+            if resolved == "all":
+                target = ""
             elif resolved is None:
                 avail = "、".join(keys) or "（暂无可查询的服务器）"
                 return (
                     f"未识别到服务器「{target}」。\n"
                     f"可查询：{avail}\n"
-                    "示例：查服 X1 / 查服 CN_YJMD_X2 / 查服 全部"
+                    "示例：查服 X1 / 查服 CN_Swiss_02 / 查服 全部"
                 )
-            else:
+            elif target and resolved:
                 target = resolved
 
         # 数据新鲜度：超过阈值才同步刷新一次（快速模式，通常 1~2 秒）
@@ -474,8 +519,10 @@ class WarbandServerStatusPlugin(Star):
         if not match:
             return
         rest = (match.group(1) or "").strip()
-        if rest and self._resolve_target(rest, self._ordered_keys()) is None:
-            return  # 如「查服 一下」这类闲聊，不回复
+        if rest:
+            resolved = self._resolve_target(rest, self._ordered_keys())
+            if resolved is None and not self._is_cn_like_name(rest):
+                return  # 如「查服 一下」这类闲聊，不回复
         reply = await self._build_reply(event, rest, silent_gate=True)
         if reply:
             yield event.plain_result(reply)

@@ -29,6 +29,12 @@
     "hint": "开启后直接发送「查服」「服务器状态」等即可触发；关闭后仅支持 @机器人 或唤醒前缀方式的指令调用。",
     "default": true
   },
+  "discovery_enabled": {
+    "type": "bool",
+    "description": "允许按未知服务器名在线搜索",
+    "hint": "查询如 CN_Swiss_02 / CN_Vinland / CN_Guardian 这类未收录的 CN_ 服务器时，会临时全量探测主服务器列表来定位（首次约数秒），之后走缓存秒回。关闭后只能查询已配置/已收录的名称。",
+    "default": true
+  },
   "servers": {
     "type": "list",
     "description": "默认查询的服务器名及顺序",
