@@ -10,12 +10,13 @@ desc: |
   调用方式：
   - 指令：@机器人或以唤醒前缀发送「查服 [目标]」，如「查服 X1」「查服 CN_X3_GK」「查服 全部」
   - 关键字：直接发送「查服」「查询服务器」「服务器状态」「骑砍服务器」等（可跟目标，如「查服 X3」）
+  - 粘连/直查：关键字与目标可无空格（如「查服CN_Xc_shanghai」）；唤醒后整句是服务器名也可直查（如「@机器人CN_Xc_shanghai」）
 
   数据来源为 TaleWorlds 官方主服务器列表 + 服务器直连探测；插件在后台定时刷新并
   内存缓存结果，收到查询优先读缓存，回复速度快。支持群聊/私聊独立开关与群号/
   用户白名单配置，未开启或不匹配时静默忽略（指令路径会给出提示）。
 author: Echo
-version: 1.0.3
+version: 1.0.4
 repo: https://github.com/fanqiecd/astrbot_plugin_warband_status
 astrbot_version: ">=4.17.0,<5"
 support_platforms:

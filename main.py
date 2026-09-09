@@ -8,6 +8,8 @@
 调用方式：
 - 命令：@机器人 / 唤醒前缀 + 「查服 [目标]」，如「查服 X1」「查服 CN_X3_GK」「查服 全部」
 - 关键字：直接发送「查服」「查询服务器」「服务器状态」「骑砍服务器」等（可跟目标，如「查服 X3」）
+- 粘连写法：关键字与目标可无空格，如「查服CN_Xc_shanghai」；@ 机器人或唤醒后整句
+  就是服务器名也可直查，如「@机器人CN_Xc_shanghai」
 
 数据链路：后台定时抓取 TaleWorlds 官方主服务器列表，只对已知 CN 主机、固定端点
 与抽样服务器做 TCP 探测（服务端直推 <ServerStats> XML），结果缓存在内存中；
@@ -38,9 +40,12 @@ DEFAULT_EXTRA_ENDPOINTS = ["106.54.62.240:7240", "106.54.62.240:7242"]
 DEFAULT_EXCLUDE_SERVERS = ["CN_X4_zuikuai"]
 
 NAME_RE = re.compile(r"^CN_X", re.IGNORECASE)
-# 关键字触发：关键词后可跟目标（可无空格），如「查服X1」「查询服务器 CN_X4」
+# 关键字触发：关键词后可跟目标（可无空格），如「查服X1」「查询服务器 CN_X4」；
+# 或整句就是一个 CN_ 服务器名（供唤醒后直查，如 @机器人CN_Xc_shanghai）
 KEYWORD_RE = re.compile(
-    r"^\s*(?:查服|查询服务器|服务器状态|骑砍服务器|骑砍状态|查骑砍)\s*(\S.*?)?\s*$"
+    r"^\s*(?:(?:查服|查询服务器|服务器状态|骑砍服务器|骑砍状态|查骑砍)\s*(\S.*?)?"
+    r"|(CN_[A-Za-z0-9_\-]{1,64}))\s*$",
+    re.IGNORECASE,
 )
 BLOCK_SEP = "---------------------------------"
 
@@ -507,18 +512,48 @@ class WarbandServerStatusPlugin(Star):
         if reply:
             yield event.plain_result(reply)
 
+    @staticmethod
+    def _keyword_glued(text: str, m: re.Match) -> bool:
+        """关键字与跟随目标之间是否无空格粘连（如「查服CN_Xc_shanghai」）。
+
+        指令路径要求「命令 + 空格 + 参数」，无法命中粘连写法，需要关键字路径兜底。
+
+        Args:
+            text: 已去首尾空白的消息文本。
+            m: 对该文本的 KEYWORD_RE 匹配结果。
+
+        Returns:
+            关键字与目标粘连时为 True；仅有关键字本身时为 False。
+        """
+        rest_start = m.start(1)
+        if rest_start < 0:
+            return False
+        return not text[rest_start - 1].isspace()
+
     @filter.regex(KEYWORD_RE)
     async def keyword_query(self, event: AstrMessageEvent):
-        """关键字触发查询，直接发送「查服」「服务器状态」等即可（无需 @ 或前缀）。"""
-        if event.is_at_or_wake_command:
-            return  # 交给指令路径处理，避免重复回复
-        if not bool(self._cfg("enable_keyword", True)):
-            return
+        """关键字触发查询，直接发送「查服」「服务器状态」等即可（无需 @ 或前缀）。
+
+        已唤醒（@ / 唤醒前缀 / 私聊默认）时通常交给指令路径按空格分词处理，避免重复回复；
+        仅当关键字与目标无空格粘连（如「查服CN_Xc_shanghai」）、或整句就是 CN_ 服务器名
+        （如「@机器人CN_Xc_shanghai」）时才在此接管——这两种写法指令路径无法命中。
+        """
         text = (event.get_message_str() or "").strip()
         match = KEYWORD_RE.match(text)
         if not match:
             return
-        rest = (match.group(1) or "").strip()
+        rest: str = (match.group(1) or "").strip()
+        bare_name = match.group(2)
+        if event.is_at_or_wake_command:
+            # 已唤醒：空格分隔的关键字指令由指令路径回复，这里只兜底粘连/裸名写法
+            if bare_name is not None:
+                rest = bare_name
+            elif not self._keyword_glued(text, match):
+                return
+        else:
+            # 未唤醒：裸服务器名不触发；直接发关键字受 enable_keyword 开关约束
+            if bare_name is not None or not bool(self._cfg("enable_keyword", True)):
+                return
         if rest:
             resolved = self._resolve_target(rest, self._ordered_keys())
             if resolved is None and not self._is_cn_like_name(rest):
