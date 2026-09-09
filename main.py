@@ -72,6 +72,7 @@ class WarbandServerStatusPlugin(Star):
         self._discover_lock = asyncio.Lock()
         self._last_probe_all: dict[tuple[str, int], float] = {}
         self._bg_task: asyncio.Task | None = None
+        self._compensation_task: asyncio.Task | None = None
 
     # ---------- 配置 ----------
 
@@ -281,6 +282,31 @@ class WarbandServerStatusPlugin(Star):
             self._last_refresh = time.time()
             return True
 
+    def _schedule_compensation_refresh(self) -> None:
+        """数据过期时安排一次后台补偿刷新（快速模式），回复路径不等待。
+
+        与常驻后台任务共享 _refresh_lock：若后台正在刷新则本次补偿静默跳过，
+        避免重复探测；补偿任务自身也去重，防止高频查询反复排队。
+        """
+        if self._compensation_task is not None and not self._compensation_task.done():
+            return
+        try:
+            self._compensation_task = asyncio.create_task(
+                self._compensation_worker(),
+                name=f"{PLUGIN_NAME}-compensation",
+            )
+        except RuntimeError:  # pragma: no cover - 无事件循环的极端情况
+            self.logger.warning("当前没有运行中的事件循环，跳过补偿刷新。")
+
+    async def _compensation_worker(self) -> None:
+        """执行一次后台补偿刷新，失败不阻塞任何回复。"""
+        try:
+            await self._run_refresh(quick_only=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 后台单次失败仅记录
+            self.logger.warning("后台补偿刷新失败: %s", exc)
+
     def _record_probe(self, ip: str, port: int, stats: dict[str, Any] | None) -> None:
         """记录一次探测（供按需发现去重），并写入缓存。"""
         self._last_probe_all[(ip, port)] = time.time()
@@ -459,11 +485,16 @@ class WarbandServerStatusPlugin(Star):
             elif target and resolved:
                 target = resolved
 
-        # 数据新鲜度：超过阈值才同步刷新一次（快速模式，通常 1~2 秒）
+        # 数据新鲜度：缓存未过期则直接用缓存回复；过期则安排一次后台异步补偿
+        # 刷新（不阻塞回复），回复仍基于当前缓存立即返回，保证查询秒回。
         max_age = max(0, int(self._cfg("max_cache_age", 60)))
         now = time.time()
-        if self._last_refresh is None or (now - self._last_refresh) > max_age:
+        if self._last_refresh is None:
+            # 冷启动且从未刷新过：后台周期任务刚开始预热，缓存可能为空；
+            # 这里同步补一次快速刷新，避免用户首次查询拿不到任何数据。
             await self._run_refresh(quick_only=True)
+        elif (now - self._last_refresh) > max_age:
+            self._schedule_compensation_refresh()
 
         show_offline = bool(self._cfg("show_offline", True))
         wanted = [target] if target else keys
@@ -485,16 +516,18 @@ class WarbandServerStatusPlugin(Star):
         await self._ensure_bg_task()
 
     async def terminate(self) -> None:
-        """插件卸载/重载时取消后台刷新任务。"""
-        if self._bg_task is not None:
-            self._bg_task.cancel()
-            try:
-                await self._bg_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:  # noqa: BLE001,S110 - 取消后台任务无需上报
-                pass
-            self._bg_task = None
+        """插件卸载/重载时取消后台刷新与补偿刷新任务。"""
+        for task in (self._bg_task, self._compensation_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001,S110 - 取消后台任务无需上报
+                    pass
+        self._bg_task = None
+        self._compensation_task = None
 
     # ---------- 指令 / 关键字 ----------
 

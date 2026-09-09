@@ -12,7 +12,7 @@
 
 为 QQ 群 / 私聊机器人提供**战团联机服务器状态查询**：内置骑砍中文站 CN_X 系列（`CN_X1`、`CN_X3_GK`、`CN_X4`），并支持固定端点直查（默认 `CN_YJMD_X1/X2` 所在的 `106.54.62.240:7240/7242`）。
 
-插件在后台定时抓取 TaleWorlds 官方主服务器列表并对目标服务器做 TCP 探测，结果缓存在内存中——收到查询**优先读缓存**，热缓存毫秒级返回，冷启动首次查询约 1~3 秒。
+插件在后台定时抓取 TaleWorlds 官方主服务器列表并对目标服务器做 TCP 探测，结果缓存在内存中——收到查询**总是立即读缓存返回**（秒回）；缓存超龄时会安排一次后台异步补偿刷新，回复本身从不等待网络探测，冷启动首次查询约 1~3 秒。
 
 ---
 
@@ -104,7 +104,7 @@ cp -r astrbot_plugin_warband_status /path/to/AstrBot/data/plugins/
 | `seed_hosts` | 中文站 CN_X 系列所在主机 IP | `["116.62.36.206"]` |
 | `show_offline` | 全量查询时是否展示未在线服务器 | `true` |
 | `refresh_interval` | 后台刷新间隔（秒） | `45` |
-| `max_cache_age` | 回复允许的缓存最大年龄（秒），超龄先刷新 | `60` |
+| `max_cache_age` | 回复允许的缓存最大年龄（秒），超龄时后台异步补刷、回复不等待 | `60` |
 | `probe_timeout` | 单台服务器查询超时（秒） | `4` |
 | `max_probe` | 每轮后台抽样探测的最大服务器数 | `60` |
 | `master_url` | TaleWorlds 官方主服务器列表地址 | `https://warbandmain.taleworlds.com/handlerservers.ashx?type=list` |
