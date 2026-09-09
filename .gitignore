@@ -3,3 +3,7 @@ __pycache__/
 *.py[cod]
 .ruff_cache/
 .venv/
+
+# 运行数据（本地/服务器生成的缓存、临时文件等）
+data/
+*.bak-*
