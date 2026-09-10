@@ -522,6 +522,7 @@ Plugin = load_plugin_for_unit_tests()
 
 class Event:
     is_at_or_wake_command = False
+    is_wake = False
 
     def __init__(self, text="查服", private=False):
         self.text, self.private = text, private
@@ -668,9 +669,15 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("7/20", replies[0])
         replies = [x async for x in plugin.cmd_query(Event(), "X1")]
         self.assertEqual(len(replies), 1)
+        # 真正唤醒（@ / 前缀）：空格分隔交给指令路径，关键字路径让路
         wake = Event("查服 X1")
+        wake.is_wake = True
         wake.is_at_or_wake_command = True
         self.assertEqual([x async for x in plugin.keyword_query(wake)], [])
+        # 心流只改 is_at_or_wake_command、未真正唤醒：关键字路径仍需回复
+        heartflow = Event("查服 X1")
+        heartflow.is_at_or_wake_command = True
+        self.assertEqual(len([x async for x in plugin.keyword_query(heartflow)]), 1)
 
 
 if __name__ == "__main__":

@@ -130,6 +130,10 @@ class WarbandServerStatusPlugin(Star):
         user_wl = self._whitelist("user_whitelist")
         return (not user_wl) or (bool(sender) and sender in user_wl)
 
+    def _log(self, level: str, msg: str, *args: Any) -> None:
+        log = getattr(self, "logger", logger)
+        getattr(log, level, log.info)(msg, *args)
+
     # ---------- 查询与状态展示 ----------
 
     @staticmethod
@@ -234,12 +238,21 @@ class WarbandServerStatusPlugin(Star):
         self, event: AstrMessageEvent, target_text: str = "", *, silent_gate: bool
     ) -> str | None:
         if not self._allowed(event):
+            self._log(
+                "info",
+                "blocked by gate | silent=%s private=%s sender=%s group=%s",
+                silent_gate,
+                event.is_private_chat(),
+                event.get_sender_id(),
+                event.get_group_id(),
+            )
             if silent_gate:
                 return None
             return "⚠ 当前会话未启用查询功能，或您不在白名单内。"
         started = time.monotonic()
         await self.service.start()
         if self.service._closed:
+            self._log("info", "service closed while building reply, drop")
             return None
         budget = self.service.number("query_wait_timeout", 3, 0.1, 15)
         deadline = time.monotonic() + budget
@@ -303,6 +316,14 @@ class WarbandServerStatusPlugin(Star):
             self.service.refresh_wake.set()
         self.service.metrics["replies"] += 1
         self.service.metrics["reply_seconds"] += time.monotonic() - started
+        self._log(
+            "info",
+            "reply ready | target=%r blocks=%d stale=%s silent_gate=%s",
+            target or "(all)",
+            len(blocks),
+            stale,
+            silent_gate,
+        )
         return (
             f"\n{BLOCK_SEP}\n".join(blocks)
             or "当前没有可展示的服务器信息，请稍后重试。"
@@ -331,6 +352,13 @@ class WarbandServerStatusPlugin(Star):
         可带目标参数：X1 / X3 / X4 / CN_X3_GK / CN_YJMD_X2 / 106.54.62.240:7240
         或 全部；不带参数默认查询全部。
         """
+        self._log(
+            "info",
+            "cmd_query | target=%r wake=%s group=%s",
+            target or "(all)",
+            bool(getattr(event, "is_wake", False)),
+            event.get_group_id(),
+        )
         reply = await self._build_reply(event, target, silent_gate=False)
         if reply:
             yield event.plain_result(reply)
@@ -357,9 +385,9 @@ class WarbandServerStatusPlugin(Star):
     async def keyword_query(self, event: AstrMessageEvent):
         """关键字触发查询，直接发送「查服」「服务器状态」等即可（无需 @ 或前缀）。
 
-        已唤醒（@ / 唤醒前缀 / 私聊默认）时通常交给指令路径按空格分词处理，避免重复回复；
-        仅当关键字与目标无空格粘连（如「查服CN_Xc_shanghai」）、或整句就是 CN_ 服务器名
-        （如「@机器人CN_Xc_shanghai」）时才在此接管——这两种写法指令路径无法命中。
+        真正的 @ / 唤醒前缀 / 私聊（is_wake）时，空格分隔的关键字交给指令路径，避免重复回复；
+        其他插件只改 is_at_or_wake_command 时不算真正唤醒，本路径仍自行回复。
+        真正唤醒时仅兜底粘连与裸名写法（如「查服CN_Xc_shanghai」、「@机器人CN_X1」）。
         """
         text = (event.get_message_str() or "").strip()
         match = KEYWORD_RE.match(text)
@@ -367,20 +395,62 @@ class WarbandServerStatusPlugin(Star):
             return
         rest: str = (match.group(1) or "").strip()
         bare_name = match.group(2)
-        if event.is_at_or_wake_command:
-            # 已唤醒：空格分隔的关键字指令由指令路径回复，这里只兜底粘连/裸名写法
+        # is_wake：框架认定的真正唤醒（@ / 唤醒前缀 / 私聊）。
+        # 心流等插件只会改 is_at_or_wake_command，不能当作真正唤醒，否则关键字路径会让路。
+        truly_woken = bool(getattr(event, "is_wake", False))
+        at_or_wake = bool(event.is_at_or_wake_command)
+        if truly_woken:
+            # 真正唤醒：空格分隔的关键字指令由指令路径回复，这里只兜底粘连/裸名写法
             if bare_name is not None:
                 rest = bare_name
             elif not self._keyword_glued(text, match):
+                self._log(
+                    "debug",
+                    "keyword_query defer to cmd | wake=%s at_or_wake=%s text=%r",
+                    truly_woken,
+                    at_or_wake,
+                    text,
+                )
                 return
         else:
-            # 未唤醒：裸服务器名不触发；直接发关键字受 enable_keyword 开关约束
-            if bare_name is not None or not bool(self._cfg("enable_keyword", True)):
+            # 未真正唤醒（含心流改标志）：裸服务器名不触发；关键字受 enable_keyword 约束
+            if bare_name is not None:
+                self._log(
+                    "debug",
+                    "keyword_query skip bare name without wake | text=%r",
+                    text,
+                )
+                return
+            if not bool(self._cfg("enable_keyword", True)):
+                self._log(
+                    "info",
+                    "keyword_query disabled by enable_keyword=false | text=%r",
+                    text,
+                )
                 return
         if rest:
             resolved = self._resolve_target(rest, self._ordered_keys())
             if resolved is None and not self._is_cn_like_name(rest):
+                self._log(
+                    "debug",
+                    "keyword_query ignore chat-like rest | rest=%r",
+                    rest,
+                )
                 return  # 如「查服 一下」这类闲聊，不回复
+        self._log(
+            "debug",
+            "keyword_query hit | wake=%s at_or_wake=%s rest=%r group=%s",
+            truly_woken,
+            at_or_wake,
+            rest,
+            event.get_group_id(),
+        )
         reply = await self._build_reply(event, rest, silent_gate=True)
         if reply:
             yield event.plain_result(reply)
+        else:
+            self._log(
+                "debug",
+                "keyword_query empty reply | rest=%r (likely gate or closed)",
+                rest,
+            )
