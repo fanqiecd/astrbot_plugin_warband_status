@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import ipaddress
 import re
 import ssl
 import urllib.parse
@@ -57,6 +59,7 @@ def parse_master_list(text: str) -> list[tuple[str, int]]:
         (ip, port) 列表，缺省端口取 DEFAULT_PORT。
     """
     addrs: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
     for item in text.split("|"):
         item = item.strip()
         if not item:
@@ -69,10 +72,16 @@ def parse_master_list(text: str) -> list[tuple[str, int]]:
             try:
                 port = int(port_s)
             except ValueError:
-                port = DEFAULT_PORT
+                continue
         else:
             ip, port = item, DEFAULT_PORT
-        addrs.append((ip, port))
+        try:
+            ip = str(ipaddress.IPv4Address(ip))
+        except ValueError:
+            continue
+        if 0 < port < 65536 and (ip, port) not in seen:
+            seen.add((ip, port))
+            addrs.append((ip, port))
     return addrs
 
 
@@ -90,13 +99,19 @@ def parse_server_stats(xml_text: str) -> dict[str, Any] | None:
     if idx < 0:
         return None
     try:
-        root = ET.fromstring(xml_text[idx:])
+        end = xml_text.find("</ServerStats>", idx)
+        if end < 0:
+            return None
+        root = ET.fromstring(xml_text[idx : end + len("</ServerStats>")])
     except ET.ParseError:
         return None
 
     def _text(tag: str) -> str | None:
         el = root.find(tag)
         return el.text.strip() if el is not None and el.text else None
+
+    if root.tag != "ServerStats" or not _text("Name"):
+        return None
 
     return {
         "name": _text("Name"),
@@ -111,58 +126,106 @@ def parse_server_stats(xml_text: str) -> dict[str, Any] | None:
     }
 
 
+@functools.lru_cache(maxsize=1)
+def _ssl_context() -> ssl.SSLContext:
+    """复用证书配置；首次创建在工作线程执行。"""
+    return ssl.create_default_context()
+
+
+def _close(writer: asyncio.StreamWriter) -> None:
+    """响应已读取或请求失败后立即释放连接，不等待对端关闭。"""
+    writer.close()
+    writer.transport.abort()
+
+
 async def http_get_text(url: str, timeout: float = 12.0) -> str:
-    """极简异步 HTTP GET（支持 HTTPS），返回响应体文本。
+    """HTTP/HTTPS GET；连接和完整正文共享总超时，不接受错误状态。"""
 
-    Args:
-        url: 请求地址。
-        timeout: 整体超时（秒）。
-
-    Returns:
-        响应体文本。
-
-    Raises:
-        OSError / asyncio.TimeoutError: 网络错误或超时。
-    """
-    parts = urllib.parse.urlsplit(url)
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    ssl_ctx = ssl.create_default_context() if parts.scheme == "https" else None
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(parts.hostname, port, ssl=ssl_ctx),
-        timeout=timeout,
-    )
-    try:
-        path = parts.path or "/"
-        if parts.query:
-            path = f"{path}?{parts.query}"
-        request = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {parts.hostname}\r\n"
-            "User-Agent: astrbot-warband-status/1.0\r\n"
-            "Accept: */*\r\n"
-            "Connection: close\r\n\r\n"
-        )
-        writer.write(request.encode("ascii"))
-        await writer.drain()
-        data = bytearray()
-        while True:
-            chunk = await asyncio.wait_for(reader.read(65536), timeout)
-            if not chunk:
-                break
-            data.extend(chunk)
-            if len(data) > 8 * 1024 * 1024:
-                break
-        text = bytes(data).decode("utf-8", "replace")
-        if text.startswith("HTTP/"):
-            _, _, body = text.partition("\r\n\r\n")
-            return body
-        return text
-    finally:
-        writer.close()
+    async def request() -> str:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            raise ValueError("主列表地址必须是 HTTP/HTTPS URL")
+        if parts.username or parts.password or any(c in url for c in "\r\n"):
+            raise ValueError("主列表地址含不支持的认证信息或换行")
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        ctx = await asyncio.to_thread(_ssl_context) if parts.scheme == "https" else None
+        reader, writer = await asyncio.open_connection(parts.hostname, port, ssl=ctx)
+        limit = 8 * 1024 * 1024
         try:
-            await writer.wait_closed()
-        except Exception:  # noqa: BLE001,S110 - 关闭连接尽力而为
-            pass
+            path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+            host = parts.netloc
+            writer.write(
+                (
+                    f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+                    "User-Agent: astrbot-warband-status/1.1\r\n"
+                    "Accept: */*\r\nConnection: close\r\n\r\n"
+                ).encode("ascii")
+            )
+            await writer.drain()
+            head = await reader.readuntil(b"\r\n\r\n")
+            lines = head.decode("iso-8859-1").split("\r\n")
+            status = lines[0].split()
+            if (
+                len(status) < 2
+                or not status[0].startswith("HTTP/")
+                or status[1] != "200"
+            ):
+                raise ValueError("主列表 HTTP 状态不是 200")
+            headers = {}
+            for line in lines[1:]:
+                if line:
+                    key, sep, value = line.partition(":")
+                    if not sep:
+                        raise ValueError("无效 HTTP 响应头")
+                    key = key.strip().lower()
+                    value = value.strip().lower()
+                    if key in {"content-length", "transfer-encoding"}:
+                        if key in headers and (
+                            key == "transfer-encoding" or headers[key] != value
+                        ):
+                            raise ValueError("冲突的 HTTP 正文分帧响应头")
+                        headers[key] = value
+            data = bytearray()
+            transfer = headers.get("transfer-encoding")
+            if transfer:
+                if transfer != "chunked":
+                    raise ValueError("不支持的 HTTP 传输编码")
+                trailer_size = 0
+                while True:
+                    line = await reader.readuntil(b"\r\n")
+                    size = int(line.split(b";", 1)[0].strip(), 16)
+                    if size < 0 or len(data) + size > limit:
+                        raise ValueError("主列表正文过大")
+                    if not size:
+                        while True:
+                            trailer = await reader.readuntil(b"\r\n")
+                            trailer_size += len(trailer)
+                            if trailer_size > 65536:
+                                raise ValueError("HTTP 尾部过大")
+                            if trailer == b"\r\n":
+                                break
+                        break
+                    data.extend(await reader.readexactly(size))
+                    if await reader.readexactly(2) != b"\r\n":
+                        raise ValueError("无效 HTTP 分块")
+            elif "content-length" in headers:
+                size = int(headers["content-length"])
+                if not 0 <= size <= limit:
+                    raise ValueError("主列表正文大小无效")
+                data.extend(await reader.readexactly(size))
+            else:
+                while True:
+                    chunk = await reader.read(65536)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    if len(data) > limit:
+                        raise ValueError("主列表正文过大")
+            return data.decode("utf-8", "replace")
+        finally:
+            _close(writer)
+
+    return await asyncio.wait_for(request(), timeout=max(0.01, timeout))
 
 
 async def fetch_server_stats(
@@ -170,53 +233,28 @@ async def fetch_server_stats(
     port: int,
     timeout: float = 4.0,
 ) -> dict[str, Any] | None:
-    """连接战团服务器并收取其推送的 <ServerStats> XML。
+    """在总预算内读取完整 XML；收齐即返回，无额外尾部等待。"""
 
-    Args:
-        host: 服务器 IP。
-        port: 服务器端口。
-        timeout: 单台服务器查询超时（秒）。
-
-    Returns:
-        解析后的字段字典；连接失败或解析失败返回 None。
-    """
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
-            timeout=max(timeout, 3.0),
-        )
-    except Exception:  # noqa: BLE001 - 探测失败视为无响应
-        return None
-    data = bytearray()
-    try:
-        while True:
-            try:
-                chunk = await asyncio.wait_for(
-                    reader.read(65536),
-                    min(2.0, timeout),
-                )
-            except Exception:  # noqa: BLE001 - 超时/中断视为本次读取结束
-                break
-            if not chunk:
-                break
-            data.extend(chunk)
-            if len(data) > 200_000:
-                break
-            if b"</ServerStats>" in data:
-                try:
-                    more = await asyncio.wait_for(reader.read(65536), 0.4)
-                    if more:
-                        data.extend(more)
-                except Exception:  # noqa: BLE001,S110 - 尾部残余数据尽力而为
-                    pass
-                break
-        return parse_server_stats(bytes(data).decode("utf-8", "replace"))
-    finally:
-        writer.close()
+    async def request() -> dict[str, Any] | None:
+        reader, writer = await asyncio.open_connection(host, port)
+        data = bytearray()
         try:
-            await writer.wait_closed()
-        except Exception:  # noqa: BLE001,S110 - 关闭连接尽力而为
-            pass
+            while True:
+                chunk = await reader.read(65536)
+                if not chunk:
+                    return None
+                data.extend(chunk)
+                if len(data) > 200_000:
+                    return None
+                if b"</ServerStats>" in data:
+                    return parse_server_stats(data.decode("utf-8", "replace"))
+        finally:
+            _close(writer)
+
+    try:
+        return await asyncio.wait_for(request(), timeout=max(0.01, timeout))
+    except (OSError, ValueError, asyncio.TimeoutError):
+        return None
 
 
 async def fetch_master_server_list(

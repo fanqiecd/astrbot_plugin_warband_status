@@ -18,26 +18,21 @@
 
 from __future__ import annotations
 
-import asyncio
 import re
 import time
+from pathlib import Path
 from typing import Any
 
-from astrbot.api import AstrBotConfig
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
 try:
-    from . import warband_net as wnet
+    from .warband_service import WarbandService, endpoint, label, normalize
 except ImportError:  # 插件目录以普通目录加载时走绝对导入
-    import warband_net as wnet
+    from warband_service import WarbandService, endpoint, label, normalize
 
 PLUGIN_NAME = "astrbot_plugin_warband_status"
-DEFAULT_MASTER_URL = "https://warbandmain.taleworlds.com/handlerservers.ashx?type=list"
-DEFAULT_SERVERS = ["CN_X1", "CN_X3_GK", "CN_X4"]
-DEFAULT_SEED_HOSTS = ["116.62.36.206"]
-DEFAULT_EXTRA_ENDPOINTS = ["106.54.62.240:7240", "106.54.62.240:7242"]
-DEFAULT_EXCLUDE_SERVERS = ["CN_X4_zuikuai"]
 
 NAME_RE = re.compile(r"^CN_X", re.IGNORECASE)
 # 关键字触发：关键词后可跟目标（可无空格），如「查服X1」「查询服务器 CN_X4」；
@@ -50,29 +45,20 @@ KEYWORD_RE = re.compile(
 BLOCK_SEP = "---------------------------------"
 
 
-def endpoint_label(pair: tuple[str, int]) -> str:
-    """把 (ip, port) 转成端点标签。"""
-    return f"{pair[0]}:{pair[1]}"
-
-
 class WarbandServerStatusPlugin(Star):
     """骑砍战团联机服务器状态查询。"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        if not hasattr(self, "logger"):
+            self.logger = logger
         self.config = config
-        self._cache: dict[str, dict[str, Any]] = {}
-        self._offline_since: dict[str, float] = {}
-        self._endpoint_last: dict[str, str] = {}
-        self._known_hosts: set[str] = set()
-        self._last_refresh: float | None = None
-        self._sweep_offset = 0
-        self._refresh_lock = asyncio.Lock()
-        self._start_lock = asyncio.Lock()
-        self._discover_lock = asyncio.Lock()
-        self._last_probe_all: dict[tuple[str, int], float] = {}
-        self._bg_task: asyncio.Task | None = None
-        self._compensation_task: asyncio.Task | None = None
+        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+        data_path = (
+            Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME / "servers.json"
+        )
+        self.service = WarbandService(self._cfg, self.logger, data_path)
 
     # ---------- 配置 ----------
 
@@ -84,71 +70,45 @@ class WarbandServerStatusPlugin(Star):
         return default if value is None else value
 
     def _whitelist(self, key: str) -> set[str]:
-        raw = self._cfg(key, [])
-        return {str(item).strip() for item in raw or [] if str(item).strip()}
-
-    def _excluded(self) -> set[str]:
-        """需要隐藏、不参与查询展示的服务器名（默认排除 CN_X4_zuikuai）。"""
-        raw = self._cfg("exclude_servers", DEFAULT_EXCLUDE_SERVERS)
-        return {str(item).strip() for item in raw or [] if str(item).strip()}
+        return set(self.service.strings(key, []))
 
     def _servers(self) -> list[str]:
-        raw = self._cfg("servers", DEFAULT_SERVERS)
-        names: list[str] = []
-        for item in raw or []:
-            name = str(item).strip()
-            if name and name not in names:
-                names.append(name)
-        return names or list(DEFAULT_SERVERS)
+        return self.service.configured()
 
     def _extra_endpoints(self) -> list[tuple[str, int]]:
-        """解析固定端点配置为 (ip, port) 列表，去重保序。"""
-        raw = self._cfg("extra_endpoints", DEFAULT_EXTRA_ENDPOINTS) or []
-        pairs: list[tuple[str, int]] = []
-        for item in raw:
-            text = str(item).strip()
-            if not text:
-                continue
-            ip, _, port_s = text.partition(":")
-            ip = ip.strip()
-            if not ip:
-                continue
-            try:
-                port = int(port_s) if port_s else wnet.DEFAULT_PORT
-            except ValueError:
-                continue
-            if not 0 < port < 65536:
-                continue
-            pair = (ip, port)
-            if pair not in pairs:
-                pairs.append(pair)
-        return pairs
+        return self.service.extras()
 
     def _ordered_keys(self) -> list[str]:
-        """可展示条目（有序）：配置服务器 → 固定端点（用最后已知名或端点）→ 发现的 CN_X*。
+        """配置顺序优先，重名时展示端点，排除项在所有入口一致生效。"""
+        keys = []
 
-        返回的每个 key 要么是缓存中的服务器名，要么是 "ip:port" 端点标签，
-        二者都可用作查询目标。
-        """
-
-        excluded = self._excluded()
-
-        def _add(key: str) -> None:
-            if key and key not in keys and key not in excluded:
+        def add(key):
+            if key not in keys:
                 keys.append(key)
 
-        keys: list[str] = []
+        def add_name(name):
+            if self.service.excluded(name):
+                return
+            matches = self.service.matching(name)
+            if len(matches) > 1:
+                for pair in matches:
+                    add(label(pair))
+            else:
+                add(self.service.records[matches[0]].name if matches else name)
+
         for name in self._servers():
-            _add(name)
+            add_name(name)
         for pair in self._extra_endpoints():
-            label = endpoint_label(pair)
-            _add(self._endpoint_last.get(label) or label)
-        for name in sorted(self._cache):
-            if NAME_RE.match(name):
-                _add(name)
-        for name in sorted(self._offline_since):
-            if NAME_RE.match(name):
-                _add(name)
+            if not self.service.visible(pair):
+                continue
+            rec = self.service.records.get(pair)
+            if rec and rec.name and self.service.matching(rec.name) == [pair]:
+                add_name(rec.name)
+            else:
+                add(label(pair))
+        for rec in sorted(self.service.records.values(), key=lambda r: r.name):
+            if NAME_RE.match(rec.name):
+                add_name(rec.name)
         return keys
 
     # ---------- 权限开关 ----------
@@ -170,364 +130,194 @@ class WarbandServerStatusPlugin(Star):
         user_wl = self._whitelist("user_whitelist")
         return (not user_wl) or (bool(sender) and sender in user_wl)
 
-    # ---------- 数据刷新 ----------
-
-    async def _ensure_bg_task(self) -> None:
-        """确保后台定时刷新任务在运行（首次查询 / 启动 / 重载后都会触发）。"""
-        async with self._start_lock:
-            if self._bg_task is not None and not self._bg_task.done():
-                return
-            try:
-                self._bg_task = asyncio.create_task(
-                    self._bg_loop(),
-                    name=f"{PLUGIN_NAME}-refresh",
-                )
-            except RuntimeError:  # pragma: no cover - 无事件循环的极端情况
-                self.logger.warning("当前没有运行中的事件循环，跳过后台刷新任务。")
-
-    async def _bg_loop(self) -> None:
-        while True:
-            try:
-                await self._run_refresh(quick_only=False)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - 后台任务需吞掉单次失败
-                self.logger.warning("后台刷新服务器数据失败: %s", exc)
-            interval = max(10, int(self._cfg("refresh_interval", 45)))
-            await asyncio.sleep(interval)
-
-    async def _run_refresh(self, quick_only: bool = True) -> bool:
-        """执行一轮刷新。
-
-        快速模式（回复路径用）只探测已知 CN 主机/种子主机的所有在列表中的地址；
-        完整模式（后台用）额外按游标抽样探测其他服务器用于发现新主机。
-
-        Args:
-            quick_only: 是否只做快速探测。
-
-        Returns:
-            是否成功完成（主列表拉取成功）。
-        """
-        if self._refresh_lock.locked():
-            return False
-        async with self._refresh_lock:
-            url = str(self._cfg("master_url", DEFAULT_MASTER_URL))
-            try:
-                addrs = await wnet.fetch_master_server_list(url, timeout=12.0)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("抓取战团主服务器列表失败: %s", exc)
-                return False
-            if not addrs:
-                self.logger.warning("战团主服务器列表为空。")
-                return False
-            addr_strs = {f"{ip}:{port}" for ip, port in addrs}
-            timeout = float(self._cfg("probe_timeout", 4))
-
-            hosts = {
-                str(item).strip()
-                for item in self._cfg("seed_hosts", DEFAULT_SEED_HOSTS)
-                if str(item).strip()
-            }
-            hosts |= self._known_hosts
-            quick = [(ip, port) for ip, port in addrs if ip in hosts]
-            if quick:
-                for ip, port, stats in await wnet.probe_many(quick, timeout):
-                    self._record_probe(ip, port, stats)
-
-            # 固定端点：每轮直接探测（不依赖主服务器列表），无论名称是否 CN_X 都收录
-            extra = self._extra_endpoints()
-            if extra:
-                for ip, port, stats in await wnet.probe_many(extra, timeout):
-                    label = endpoint_label((ip, port))
-                    self._record_probe(ip, port, stats)
-                    name = (stats.get("name") or "").strip() if stats else ""
-                    if name:
-                        self._endpoint_last[label] = name
-                    else:
-                        # 无响应：移除该端点对应的缓存记录，保留最后已知名供离线展示
-                        for cached_name, rec in list(self._cache.items()):
-                            if rec.get("addr") == label:
-                                self._cache.pop(cached_name, None)
-                                self._offline_since[cached_name] = time.time()
-
-            if not quick_only:
-                quick_set = {f"{ip}:{port}" for ip, port in quick}
-                others = [
-                    (ip, port) for ip, port in addrs if f"{ip}:{port}" not in quick_set
-                ]
-                if others:
-                    limit = min(max(1, int(self._cfg("max_probe", 60))), len(others))
-                    offset = self._sweep_offset % len(others)
-                    chosen = [others[(offset + i) % len(others)] for i in range(limit)]
-                    self._sweep_offset = (offset + limit) % len(others)
-                    for ip, port, stats in await wnet.probe_many(chosen, timeout):
-                        self._record_probe(ip, port, stats)
-
-            # 下线复核：缓存中但已不在主列表的地址直接复查一次
-            for name, rec in list(self._cache.items()):
-                addr = rec.get("addr", "")
-                if not addr or addr in addr_strs:
-                    continue
-                ip_s, _, port_s = addr.partition(":")
-                try:
-                    port_i = int(port_s)
-                except ValueError:
-                    continue
-                stats = await wnet.fetch_server_stats(ip_s, port_i, timeout)
-                self._last_probe_all[(ip_s, port_i)] = time.time()
-                if stats is None or (stats.get("name") or "") != name:
-                    self._cache.pop(name, None)
-                    self._offline_since[name] = time.time()
-
-            self._last_refresh = time.time()
-            return True
-
-    def _schedule_compensation_refresh(self) -> None:
-        """数据过期时安排一次后台补偿刷新（快速模式），回复路径不等待。
-
-        与常驻后台任务共享 _refresh_lock：若后台正在刷新则本次补偿静默跳过，
-        避免重复探测；补偿任务自身也去重，防止高频查询反复排队。
-        """
-        if self._compensation_task is not None and not self._compensation_task.done():
-            return
-        try:
-            self._compensation_task = asyncio.create_task(
-                self._compensation_worker(),
-                name=f"{PLUGIN_NAME}-compensation",
-            )
-        except RuntimeError:  # pragma: no cover - 无事件循环的极端情况
-            self.logger.warning("当前没有运行中的事件循环，跳过补偿刷新。")
-
-    async def _compensation_worker(self) -> None:
-        """执行一次后台补偿刷新，失败不阻塞任何回复。"""
-        try:
-            await self._run_refresh(quick_only=True)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - 后台单次失败仅记录
-            self.logger.warning("后台补偿刷新失败: %s", exc)
-
-    def _record_probe(self, ip: str, port: int, stats: dict[str, Any] | None) -> None:
-        """记录一次探测（供按需发现去重），并写入缓存。"""
-        self._last_probe_all[(ip, port)] = time.time()
-        self._apply_result(ip, port, stats)
-
-    def _apply_result(self, ip: str, port: int, stats: dict[str, Any] | None) -> None:
-        """写入一次探测结果。
-
-        只要服务器返回了名称就收录（供按名称查询），但受 exclude_servers 排除。
-
-        Args:
-            ip: 服务器 IP。
-            port: 服务器端口。
-            stats: 解析出的服务器信息。
-        """
-        if not stats:
-            return
-        name = (stats.get("name") or "").strip()
-        if not name:
-            return
-        if name in self._excluded():
-            return  # 配置排除的服务器不缓存、不展示
-        self._known_hosts.add(ip)
-        self._cache[name] = {
-            "name": name,
-            "addr": f"{ip}:{port}",
-            "ts": time.time(),
-            **stats,
-        }
-        self._offline_since.pop(name, None)
+    # ---------- 查询与状态展示 ----------
 
     @staticmethod
     def _is_cn_like_name(raw: str) -> bool:
-        """判断目标是否可能是 CN_ 前缀的服务器名（用于触发按需发现）。"""
-        key = re.sub(r"[\s_\-]", "", raw).strip().lower().removeprefix("cn")
-        return bool(re.fullmatch(r"[a-z0-9]{2,30}", key))
+        return bool(re.fullmatch(r"[a-z0-9]{2,64}", normalize(raw)))
 
-    async def _discover_names(self) -> None:
-        """按需全量探测：用于查询尚未被收录的服务器名（如 CN_Swiss_02）。
-
-        只探测近期未探过的地址，探测结果进入缓存后即可按名称查询。
-        """
-        if not bool(self._cfg("discovery_enabled", True)):
-            return
-        if self._refresh_lock.locked() or self._discover_lock.locked():
-            return  # 已有刷新/发现在进行，稍后即可命中缓存
-        async with self._discover_lock:
-            url = str(self._cfg("master_url", DEFAULT_MASTER_URL))
-            try:
-                addrs = await wnet.fetch_master_server_list(url, timeout=12.0)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("按需发现失败（主服务器列表不可达）: %s", exc)
-                return
-            if not addrs:
-                return
-            now = time.time()
-            todo = [a for a in addrs if now - self._last_probe_all.get(a, 0.0) > 90.0]
-            if not todo:
-                return
-            timeout = float(self._cfg("probe_timeout", 4))
-            self.logger.info("按名称查询触发在线发现，探测 %d 台服务器 ...", len(todo))
-            for ip, port, stats in await wnet.probe_many(todo, timeout, concurrency=64):
-                self._record_probe(ip, port, stats)
-
-    # ---------- 目标解析与格式化 ----------
+    def _candidates(self, raw: str, names: list[str], fuzzy: bool = True) -> list[str]:
+        key = normalize(raw)
+        if key in {"全部", "所有", "all", "*"}:
+            return ["all"]
+        # 完整端点和端口号只能匹配已知地址，不把用户输入变成任意网络探测。
+        available = set(self._extra_endpoints()) | set(self.service.records)
+        if ":" in raw:
+            pair = endpoint(raw)
+            return (
+                [label(pair)]
+                if pair in available and self.service.visible(pair)
+                else []
+            )
+        if key.isdigit() and len(key) > 2:
+            return [
+                label(p)
+                for p in sorted(available)
+                if p[1] == int(key) and self.service.visible(p)
+            ]
+        if key.isdigit():
+            key = "x" + key
+        # matching 接受原始名称；补回前缀，防止 CN_CNxxx 被重复剥离。
+        exact = self.service.matching("CN_" + key)
+        if exact:
+            return (
+                [label(p) for p in exact]
+                if len(exact) > 1
+                else [self.service.records[exact[0]].name]
+            )
+        search = list(
+            dict.fromkeys(
+                names + [r.name for r in self.service.records.values() if r.name]
+            )
+        )
+        search = [
+            name
+            for name in search
+            if ":" not in name and not self.service.excluded(name)
+        ]
+        exact_names = [name for name in search if normalize(name) == key]
+        if exact_names:
+            return exact_names
+        if not fuzzy or len(key) < 2:
+            return []
+        matches = [
+            name
+            for name in search
+            if normalize(name).endswith(key)
+            or (key.startswith("x") and normalize(name).startswith(key))
+        ]
+        result = []
+        for name in matches:
+            pairs = self.service.matching(name)
+            result.extend([label(p) for p in pairs] if len(pairs) > 1 else [name])
+        return list(dict.fromkeys(result))
 
     def _resolve_target(self, raw: str, names: list[str]) -> str | None:
-        """把用户输入解析成服务器名。
-
-        支持：全名（CN_X3_GK / CN_Swiss_02）、简称（X3 / GK / swiss02）、
-        别名（全部 / all）、端点端口号（7240）等；除传入的有序名单外，
-        也会匹配缓存中已收录的任何服务器名。
-
-        Args:
-            raw: 用户输入。
-            names: 可用的服务器名（有序）。
-
-        Returns:
-            服务器名；"all" 表示查询全部；无法识别返回 None。
-        """
-        key = re.sub(r"[\s_\-]", "", raw).strip().lower()
-        if not key:
-            return None
-        key = key.removeprefix("cn")
-        if key in ("全部", "所有", "all", "*"):
-            return "all"
-        # 固定端点：完整端点（ip:port）或纯端口号匹配
-        for pair in self._extra_endpoints():
-            label = endpoint_label(pair)
-            label_lower = label.lower()
-            if key == label_lower or (key.isdigit() and label_lower.endswith(key)):
-                return label
-        if key.isdigit() and len(key) <= 2:
-            key = f"x{key}"
-        search = list(names)
-        for cached in sorted(self._cache):
-            if cached not in search:
-                search.append(cached)
-        for name in search:
-            nk = re.sub(r"[\s_\-]", "", name).lower().removeprefix("cn")
-            if key == nk:
-                return name
-            if len(key) >= 2 and (
-                nk.endswith(key) or (key.startswith("x") and nk.startswith(key))
-            ):
-                return name
-        return None
+        matches = self._candidates(raw, names)
+        return matches[0] if len(matches) == 1 else None
 
     def _record_for(self, key: str) -> tuple[str, dict[str, Any] | None]:
-        """按显示 key 找缓存记录。
-
-        key 可能是服务器名，也可能是端点标签（此时返回实际服务器名 + 记录）。
-
-        Args:
-            key: 服务器名或 "ip:port" 端点标签。
-
-        Returns:
-            (展示用服务器名, 缓存记录或 None)。
-        """
-        rec = self._cache.get(key)
-        if rec is not None:
-            return key, rec
-        for name, item in self._cache.items():
-            if item.get("addr") == key:
-                return name, item
-        return key, None
-
-    def _format_block(self, name: str, rec: dict[str, Any] | None) -> str:
+        pairs = [endpoint(key)] if ":" in key else self.service.matching(key)
+        pair = pairs[0] if len(pairs) == 1 else None
+        rec = self.service.records.get(pair)
         if rec is None:
-            return f"服务器名称：{name}\n状态：未在线（服务器无响应或未开服）"
-        return "\n".join(
-            [
-                f"服务器名称：{rec.get('name') or name}",
-                f"游戏模式：{rec.get('map_type') or '未知'}",
-                f"当前地图：{rec.get('map_name') or '未知'}",
-                f"当前模块：{rec.get('module') or '未知'}",
-                f"在线人数：{rec.get('players') or '0'}/{rec.get('max_players') or '未知'}",
-            ]
+            return key, None
+        display = rec.name or key
+        if ":" in key and rec.name or len(self.service.matching(rec.name)) > 1:
+            display += f"（{label(pair)}）"
+        return display, dict(
+            rec.stats, ts=rec.success, state=self.service.state(rec), addr=label(pair)
         )
 
+    def _format_block(self, name: str, rec: dict[str, Any] | None) -> str:
+        state = rec.get("state") if rec else "unknown"
+        if state in {"unknown", "unresponsive"}:
+            message = (
+                "暂无结果，正在查询，请稍后重试"
+                if state == "unknown"
+                else "近期无响应（无法确认是否开服）"
+            )
+            return f"服务器名称：{name}\n状态：{message}"
+        lines = [
+            f"服务器名称：{name}",
+            f"游戏模式：{rec.get('map_type') or '未知'}",
+            f"当前地图：{rec.get('map_name') or '未知'}",
+            f"当前模块：{rec.get('module') or '未知'}",
+            f"在线人数：{rec.get('players') or '0'}/{rec.get('max_players') or '未知'}",
+        ]
+        if state == "stale":
+            stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(rec["ts"]))
+            lines.append(f"数据时间：{stamp}（上次结果，正在后台更新）")
+        return "\n".join(lines)
+
     async def _build_reply(
-        self,
-        event: AstrMessageEvent,
-        target_text: str,
-        *,
-        silent_gate: bool,
+        self, event: AstrMessageEvent, target_text: str = "", *, silent_gate: bool
     ) -> str | None:
-        """构造查询回复文本；不满足开关/白名单时返回 None（静默）或提示。"""
         if not self._allowed(event):
             if silent_gate:
                 return None
-            if event.is_private_chat():
-                return "⚠ 私聊查询功能未开启，或您不在白名单内。"
-            return "⚠ 当前群未启用查询功能，或不在白名单内。"
-
-        await self._ensure_bg_task()
-        keys = self._ordered_keys()
+            return "⚠ 当前会话未启用查询功能，或您不在白名单内。"
+        started = time.monotonic()
+        await self.service.start()
+        if self.service._closed:
+            return None
+        budget = self.service.number("query_wait_timeout", 3, 0.1, 15)
+        deadline = time.monotonic() + budget
         target = (target_text or "").strip()
-        if target:
-            resolved = self._resolve_target(target, keys)
-            if resolved == "all":
-                target = ""
-            elif resolved is None and self._is_cn_like_name(target):
-                # 可能是尚未收录的 CN_ 系列服务器：先在线全量发现一次再解析
-                await self._discover_names()
-                resolved = self._resolve_target(target, self._ordered_keys())
-            if resolved == "all":
-                target = ""
-            elif resolved is None:
-                avail = "、".join(keys) or "（暂无可查询的服务器）"
-                return (
-                    f"未识别到服务器「{target}」。\n"
-                    f"可查询：{avail}\n"
-                    "示例：查服 X1 / 查服 CN_Swiss_02 / 查服 全部"
+        discovery_status = None
+        if target and normalize(target) not in {"all", "全部", "所有", "*"}:
+            if self.service.excluded(target):
+                return f"服务器「{target}」已被排除。"
+            matches = self._candidates(target, self._ordered_keys())
+            if not matches and self._is_cn_like_name(target):
+                discovery_status = await self.service.discover(target, budget)
+                # 扫描中只采用精确名称，完整结束后才使用模糊结果。
+                matches = self._candidates(
+                    target, self._ordered_keys(), fuzzy=discovery_status != "pending"
                 )
-            elif target and resolved:
-                target = resolved
-
-        # 数据新鲜度：缓存未过期则直接用缓存回复；过期则安排一次后台异步补偿
-        # 刷新（不阻塞回复），回复仍基于当前缓存立即返回，保证查询秒回。
-        max_age = max(0, int(self._cfg("max_cache_age", 60)))
-        now = time.time()
-        if self._last_refresh is None:
-            # 冷启动且从未刷新过：后台周期任务刚开始预热，缓存可能为空；
-            # 这里同步补一次快速刷新，避免用户首次查询拿不到任何数据。
-            await self._run_refresh(quick_only=True)
-        elif (now - self._last_refresh) > max_age:
-            self._schedule_compensation_refresh()
-
-        show_offline = bool(self._cfg("show_offline", True))
-        wanted = [target] if target else keys
-        blocks: list[str] = []
+            if len(matches) > 1:
+                return "匹配到多个服务器，请指定完整名称或端点：\n" + "、".join(matches)
+            if not matches:
+                if discovery_status == "pending":
+                    return (
+                        f"正在查询服务器「{target}」，请稍后重试；后续查询将复用结果。"
+                    )
+                if discovery_status == "unavailable":
+                    return f"暂未定位到服务器「{target}」，部分端点或主列表无响应，请稍后重试。"
+                return f"未识别到服务器「{target}」。\n可查询：{'、'.join(self._ordered_keys())}"
+            target = matches[0]
+        else:
+            target = ""
+        wanted = [target] if target else self._ordered_keys()
+        pairs = []
+        for key in wanted:
+            pair = endpoint(key) if ":" in key else None
+            candidates = [pair] if pair else self.service.matching(key)
+            for pair in candidates:
+                self.service.touch(pair)
+                pairs.append(pair)
+        # 热缓存路径不等待任何探测；无缓存时只等待一次有界的首次结果。
+        if not any(self._record_for(key)[1] for key in wanted):
+            remaining = max(0.01, deadline - time.monotonic())
+            if target and not pairs and self._is_cn_like_name(target):
+                await self.service.discover(target, remaining)
+            else:
+                await self.service.wait_initial(pairs, remaining)
+        wanted = [target] if target else self._ordered_keys()
+        blocks = []
+        if self.service._closed:
+            return None
+        stale = False
         for key in wanted:
             display, rec = self._record_for(key)
-            if rec is None and not target and not show_offline:
+            state = rec.get("state") if rec else "unknown"
+            stale |= state != "fresh"
+            if (
+                state == "unresponsive"
+                and not target
+                and not bool(self._cfg("show_offline", True))
+            ):
                 continue
             blocks.append(self._format_block(display, rec))
-        if not blocks:
-            return "当前没有可展示的服务器信息，请稍后重试。"
-        return f"\n{BLOCK_SEP}\n".join(blocks)
+        if stale:
+            self.service.refresh_wake.set()
+        self.service.metrics["replies"] += 1
+        self.service.metrics["reply_seconds"] += time.monotonic() - started
+        return (
+            f"\n{BLOCK_SEP}\n".join(blocks)
+            or "当前没有可展示的服务器信息，请稍后重试。"
+        )
 
-    # ---------- 生命周期 ----------
+    async def initialize(self) -> None:
+        """每次加载或重载后预热；查询入口另有幂等兜底。"""
+        await self.service.start()
 
     @filter.on_astrbot_loaded()
     async def _on_astrbot_loaded(self) -> None:
-        """AstrBot 启动完成后启动后台刷新以预热缓存。"""
-        await self._ensure_bg_task()
+        await self.service.start()
 
     async def terminate(self) -> None:
-        """插件卸载/重载时取消后台刷新与补偿刷新任务。"""
-        for task in (self._bg_task, self._compensation_task):
-            if task is not None:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:  # noqa: BLE001,S110 - 取消后台任务无需上报
-                    pass
-        self._bg_task = None
-        self._compensation_task = None
+        await self.service.stop()
 
     # ---------- 指令 / 关键字 ----------
 

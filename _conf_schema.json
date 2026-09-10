@@ -13,14 +13,18 @@
     "type": "list",
     "description": "允许的群号白名单",
     "hint": "每项填一个群号。留空表示所有群都允许；填写后不在列表内的群不会响应。",
-    "items": { "type": "string" },
+    "items": {
+      "type": "string"
+    },
     "default": []
   },
   "user_whitelist": {
     "type": "list",
     "description": "允许的用户 ID 白名单",
     "hint": "每项填一个用户 ID。留空表示所有用户都允许；填写后不在列表内的用户不会响应。",
-    "items": { "type": "string" },
+    "items": {
+      "type": "string"
+    },
     "default": []
   },
   "enable_keyword": {
@@ -32,58 +36,79 @@
   "discovery_enabled": {
     "type": "bool",
     "description": "允许按未知服务器名在线搜索",
-    "hint": "查询如 CN_Swiss_02 / CN_Vinland / CN_Guardian 这类未收录的 CN_ 服务器时，会临时全量探测主服务器列表来定位（首次约数秒），之后走缓存秒回。关闭后只能查询已配置/已收录的名称。",
+    "hint": "未收录名称可在线发现。找到精确目标即返回，查询超时后后台继续；多人共享扫描。网络失败只提示暂未定位，不判定服务器不存在。",
     "default": true
   },
   "servers": {
     "type": "list",
     "description": "默认查询的服务器名及顺序",
     "hint": "中文站 X 系列如 CN_X1 / CN_X3_GK / CN_X4，全量查询按此顺序输出。未在列表中的 CN_X 前缀服务器在线时也会被自动发现并追加展示，不想要的用 exclude_servers 排除。",
-    "items": { "type": "string" },
-    "default": ["CN_X1", "CN_X3_GK", "CN_X4"]
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "CN_X1",
+      "CN_X3_GK",
+      "CN_X4"
+    ]
   },
   "exclude_servers": {
     "type": "list",
     "description": "隐藏、不参与查询的服务器名",
     "hint": "默认排除 CN_X4_zuikuai。被排除的服务器不会被缓存，也不会被全量或指定查询返回；需要显示时把它从本列表移除。",
-    "items": { "type": "string" },
-    "default": ["CN_X4_zuikuai"]
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "CN_X4_zuikuai"
+    ]
   },
   "extra_endpoints": {
     "type": "list",
     "description": "固定直查端点（ip:port）",
     "hint": "每轮直接探测、不依赖主服务器列表。服务器在线时按它自报的名称展示；未开服或无响应时显示最后已知名称或端点本身。",
-    "items": { "type": "string" },
-    "default": ["106.54.62.240:7240", "106.54.62.240:7242"]
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "106.54.62.240:7240",
+      "106.54.62.240:7242"
+    ]
   },
   "seed_hosts": {
     "type": "list",
     "description": "优先探测的主机 IP",
-    "hint": "每次刷新都会探测这些主机在主服务器列表里的全部端口，保证回复快。官方更换服务器主机时可在此补充新 IP。",
-    "items": { "type": "string" },
-    "default": ["116.62.36.206"]
+    "hint": "在已缓存的官方主列表中优先探测这些主机的端口；主列表独立更新，不阻塞固定端点。更换服务器主机时可补充新 IP。",
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "116.62.36.206"
+    ]
   },
   "show_offline": {
     "type": "bool",
     "description": "是否展示未在线服务器",
-    "hint": "全量查询时，未在线的目标服务器会显示「未在线」；关闭后直接省略这些条目。",
+    "hint": "是否在全部查询中展示近期无响应的服务器。尚未查询与上次结果会明确标记；指定单台查询始终给出状态。",
     "default": true
   },
   "refresh_interval": {
     "type": "int",
     "description": "后台刷新服务器数据的间隔（秒）",
-    "default": 45
+    "default": 45,
+    "hint": "常用服务器的后台状态刷新间隔，保留原有默认 45 秒。有效范围 10～3600 秒；可根据负载调整为 15～30 秒。"
   },
   "max_cache_age": {
     "type": "int",
     "description": "缓存数据最大可接受年龄（秒）",
-    "hint": "收到查询时若缓存超过该年龄，会先做一次快速刷新再返回，保证数据新鲜。",
+    "hint": "单台服务器超过该年龄时立即返回标注时间的上次结果，并安排后台补刷；不等待网络。超过至少 5 分钟或连续 3 次失败后显示近期无响应。",
     "default": 60
   },
   "probe_timeout": {
     "type": "int",
-    "description": "单台服务器查询超时（秒）",
-    "default": 4
+    "description": "单台服务器探测总超时（秒）",
+    "default": 4,
+    "hint": "连接和读取共享总预算，不再逐段重新计时。有效范围 0.1～30 秒；配置类型为整数时建议保留 4 秒，先根据测量再调整。"
   },
   "max_probe": {
     "type": "int",
@@ -96,5 +121,23 @@
     "description": "主服务器列表接口地址",
     "hint": "TaleWorlds 官方战团主服务器列表，返回所有在线服务器。一般无需修改。",
     "default": "https://warbandmain.taleworlds.com/handlerservers.ashx?type=list"
+  },
+  "master_refresh_interval": {
+    "type": "int",
+    "description": "官方主列表刷新间隔（秒）",
+    "hint": "只影响地址发现，不影响固定端点与已知服务器状态刷新。有效范围 30～3600 秒；列表失败保留上次结果并在 30 秒后重试。",
+    "default": 180
+  },
+  "query_wait_timeout": {
+    "type": "int",
+    "description": "首次及未知查询等待预算（秒）",
+    "hint": "缓存命中立即返回。没有结果时最多等待该预算，超时提示稍后重试，后台继续查询；不会追加自动推送。有效范围 0.1～15 秒。",
+    "default": 3
+  },
+  "probe_concurrency": {
+    "type": "int",
+    "description": "全局探测并发上限",
+    "hint": "刷新和发现共享连接上限；单轮扫描只使用四分之一额度。有效范围 4～128；修改后重载插件生效。",
+    "default": 32
   }
 }
